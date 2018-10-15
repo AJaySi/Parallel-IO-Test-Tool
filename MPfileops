@@ -1,0 +1,133 @@
+#!/usr/bin/env python
+import multiprocessing
+import subprocess
+import random
+import config
+import os
+import glob
+import logging
+import time
+from random import randint
+from lockfile import LockFile
+
+locked = False # Flag
+logger = config.LOGGER
+
+# Helper method to give the hostname with interfaces. This is required to know IO origins for debugging.
+# This will help us to which and how many interfaces are being kept busy.
+# TBD : Put this under utils
+# returns : unique indentifier for knowing the IO interfaces details.
+def get_interface_hostname():
+    
+    # Get/write request need to randomized on the available scaler interfaces.
+    # Randmize for now scheduler for choosing/distributing connection on
+    # available interfaces of the scalers. 
+    # A simple Round robin for scaler interfaces can be implemented for equal IO requests from end clients.
+    interface_to = config.SCALER_INTERFACES['object_storage_bucket']
+    random.shuffle(interface_to)
+
+    # There requirement is to make the filename unique and also client, interface specfic
+    # This will help in debugging and knowing IO simulations in predictable manner.
+    hostnm = os.popen("hostname").read()
+    interface = interface_to.pop()
+    return interface, hostnm
+
+
+class MPfileops(object):
+	# method that controls the multiprocessing create operation
+    def create(self,):
+        
+        inputs = list(range(5))  ## TBD to add as a config value
+		# MP worker pool size recommended and practical is twice the host's CPU count.
+        write_pool_size = multiprocessing.cpu_count() * 2##
+        write_pool = multiprocessing.Pool(processes=write_pool_size,
+                                          initializer=_mp_start_process, )
+        write_pool_outputs = write_pool.map(_mp_write, inputs) 
+        write_pool.close()
+        write_pool.join()
+
+        return True
+
+	# This method decides which files to be deleted.
+    def delete(self,):
+        
+        try:
+            files_list = glob.glob('/test/Bucket/*')
+        except Exception as e:
+            logger.error('Error : {}'.format(e))
+
+        n = 20 ## create a chunk size of 20 files to delete; we can alter the logic if we need to clean up all files
+        files_chunk_list = [files_list[i:i + n] for i in range(0, len(files_list), n)]
+        chunk_to_delete = files_chunk_list[0]
+        logger.info('The following chunk will be deleted : {}'.format(chunk_to_delete))
+        delete_pool = multiprocessing.Pool(processes = 2)
+        delete_result = delete_pool.map(_mp_delete,chunk_to_delete) 
+        return True
+
+# This function creates the workload files of variety of sizes
+# :param args: filename
+# :return: True
+def _mp_write(args):
+   
+    global locked
+    proc_name = multiprocessing.current_process().name
+    proc_id = os.getpid()
+    interface,hostnm = get_interface_hostname()
+    file_name = proc_name + "-" + str(proc_id) + "-" + interface  + "-" + hostnm
+    
+	logger.info('Write Process name {0} Writing file {1} from client {2} using Interface {3}'.format(proc_name,
+                                                                                    file_name, hostnm, interface))
+    bucket = config.DISK_MOUNT['mount_path']
+    try:
+        process = subprocess.Popen(bucket.split(), stdout=subprocess.PIPE)
+        output, error = process.communicate()
+    except Exception as e:
+        logger.error('Error: {}'.format(e))
+    
+	## use the dd command with variety in block-storage sizes; randomize the filesizes between 1MB-10MB
+    bashCommand = 'dd if=/dev/zero of=/test/Bucket/%s bs=%sM count=1' % ( file_name, randint(1, 10))
+    file_to_lock = '/test/Bucket/%s'%file_name
+    logger.info('Acquiring Lock on File: {0} to prevent Delete on it'.format(file_to_lock))
+    lock = LockFile(file_to_lock)
+    locked = True
+	
+	# acquire the lock on the file to be written
+    lock.acquire()
+    try:
+        process = subprocess.Popen(bashCommand.split(), stdout=subprocess.PIPE)
+        output, error = process.communicate()
+    except Exception as e:
+        print e
+    logger.info('Releasing Lock on File: {0} : candidate for delete'.format(file_to_lock))
+    lock.release()
+    locked = False
+    return True
+
+# function to delete the received file chunk as a multiprocessing task 
+# :param args: file chunks
+# :return:
+def _mp_delete(args):
+  
+    global locked
+    proc_name = multiprocessing.current_process().name
+    proc_id = os.getpid()
+    interface, hostnm = get_interface_hostname()
+    logger.info('Delete Process name {0} Delete file chunk {1} from client {2} using Interface {3}'.format(proc_name,
+                                                                                        args, hostnm,interface))
+																						
+    # Check if the file is not locked and hence can be deleted. A file open for write will fail deletion.
+	if not locked:
+        if os.path.isfile(args):
+            os.remove(args)  # remove the file
+        else:
+            raise ValueError("file {} is not a file or dir.".format(args))
+    else:
+		# skip & retry file delete, as it is being written by other processes.
+        pass
+
+
+def _mp_start_process():
+    logger.info 'Starting Process', multiprocessing.current_process().name
+
+if __name__ == '__main__':
+    pass
